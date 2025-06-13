@@ -1,13 +1,14 @@
 require('dotenv').config();
+const { App } = require('@slack/bolt');
+const { Pool } = require('pg');
 
 // Debug logging
 console.log('=== ENVIRONMENT VARIABLES DEBUG ===');
 console.log('SLACK_BOT_TOKEN:', process.env.SLACK_BOT_TOKEN ? 'EXISTS' : 'MISSING');
 console.log('SLACK_SIGNING_SECRET:', process.env.SLACK_SIGNING_SECRET ? 'EXISTS' : 'MISSING');
 console.log('SLACK_APP_TOKEN:', process.env.SLACK_APP_TOKEN ? 'EXISTS' : 'MISSING');
+console.log('DATABASE_URL:', process.env.DATABASE_URL ? 'EXISTS' : 'MISSING');
 console.log('===============================');
-
-const { App } = require('@slack/bolt');
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -16,23 +17,185 @@ const app = new App({
   appToken: process.env.SLACK_APP_TOKEN
 });
 
-// In-memory storage (we'll add database later)
-const markets = new Map();
-const users = new Map();
+// PostgreSQL connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
 
-// Initialize user with starting bankroll
-function initializeUser(userId) {
-  if (!users.has(userId)) {
-    users.set(userId, {
-      id: userId,
-      bankroll: 1000,
-      totalStaked: 0,
-      betsPlaced: 0,
-      betsWon: 0,
-      accuracy: 0.5
-    });
+// Initialize database tables
+async function initializeDatabase() {
+  try {
+    // Create users table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id VARCHAR(255) PRIMARY KEY,
+        bankroll INTEGER DEFAULT 1000,
+        total_staked INTEGER DEFAULT 0,
+        bets_placed INTEGER DEFAULT 0,
+        bets_won INTEGER DEFAULT 0,
+        accuracy DECIMAL(3,2) DEFAULT 0.5,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create markets table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS markets (
+        id VARCHAR(255) PRIMARY KEY,
+        question TEXT NOT NULL,
+        creator VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        deadline TIMESTAMP NOT NULL,
+        resolved BOOLEAN DEFAULT FALSE,
+        resolution BOOLEAN DEFAULT NULL,
+        resolved_at TIMESTAMP DEFAULT NULL,
+        probability DECIMAL(5,4) DEFAULT 0.5,
+        total_stake INTEGER DEFAULT 0,
+        active BOOLEAN DEFAULT TRUE
+      )
+    `);
+
+    // Create bets table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bets (
+        id SERIAL PRIMARY KEY,
+        market_id VARCHAR(255) REFERENCES markets(id),
+        user_id VARCHAR(255) NOT NULL,
+        stake INTEGER NOT NULL,
+        probability DECIMAL(5,4) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(market_id, user_id)
+      )
+    `);
+
+    console.log('✅ Database tables initialized successfully');
+  } catch (error) {
+    console.error('❌ Database initialization failed:', error);
   }
-  return users.get(userId);
+}
+
+// Database helper functions
+async function getUser(userId) {
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
+    if (result.rows.length === 0) {
+      // Create new user
+      await pool.query(`
+        INSERT INTO users (id, bankroll, total_staked, bets_placed, bets_won, accuracy)
+        VALUES ($1, 1000, 0, 0, 0, 0.5)
+      `, [userId]);
+      return { id: userId, bankroll: 1000, total_staked: 0, bets_placed: 0, bets_won: 0, accuracy: 0.5 };
+    }
+    return result.rows[0];
+  } catch (error) {
+    console.error('Error getting user:', error);
+    throw error;
+  }
+}
+
+async function updateUser(userId, updates) {
+  try {
+    const fields = Object.keys(updates).map((key, index) => `${key} = $${index + 2}`).join(', ');
+    const values = [userId, ...Object.values(updates)];
+    await pool.query(`UPDATE users SET ${fields} WHERE id = $1`, values);
+  } catch (error) {
+    console.error('Error updating user:', error);
+    throw error;
+  }
+}
+
+async function getMarket(marketId) {
+  try {
+    const result = await pool.query('SELECT * FROM markets WHERE id = $1', [marketId]);
+    return result.rows.length > 0 ? result.rows[0] : null;
+  } catch (error) {
+    console.error('Error getting market:', error);
+    throw error;
+  }
+}
+
+async function createMarket(marketData) {
+  try {
+    await pool.query(`
+      INSERT INTO markets (id, question, creator, deadline, probability, total_stake, active)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `, [
+      marketData.id,
+      marketData.question,
+      marketData.creator,
+      marketData.deadline,
+      marketData.probability,
+      marketData.totalStake,
+      marketData.active
+    ]);
+  } catch (error) {
+    console.error('Error creating market:', error);
+    throw error;
+  }
+}
+
+async function updateMarket(marketId, updates) {
+  try {
+    const fields = Object.keys(updates).map((key, index) => `${key} = $${index + 2}`).join(', ');
+    const values = [marketId, ...Object.values(updates)];
+    await pool.query(`UPDATE markets SET ${fields} WHERE id = $1`, values);
+  } catch (error) {
+    console.error('Error updating market:', error);
+    throw error;
+  }
+}
+
+async function getMarketBets(marketId) {
+  try {
+    const result = await pool.query('SELECT * FROM bets WHERE market_id = $1', [marketId]);
+    return result.rows;
+  } catch (error) {
+    console.error('Error getting market bets:', error);
+    throw error;
+  }
+}
+
+async function getUserBet(marketId, userId) {
+  try {
+    const result = await pool.query('SELECT * FROM bets WHERE market_id = $1 AND user_id = $2', [marketId, userId]);
+    return result.rows.length > 0 ? result.rows[0] : null;
+  } catch (error) {
+    console.error('Error getting user bet:', error);
+    throw error;
+  }
+}
+
+async function upsertBet(marketId, userId, stake, probability) {
+  try {
+    await pool.query(`
+      INSERT INTO bets (market_id, user_id, stake, probability, updated_at)
+      VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+      ON CONFLICT (market_id, user_id)
+      DO UPDATE SET 
+        stake = EXCLUDED.stake,
+        probability = EXCLUDED.probability,
+        updated_at = CURRENT_TIMESTAMP
+    `, [marketId, userId, stake, probability]);
+  } catch (error) {
+    console.error('Error upserting bet:', error);
+    throw error;
+  }
+}
+
+async function getActiveMarkets() {
+  try {
+    const result = await pool.query(`
+      SELECT * FROM markets 
+      WHERE active = true AND resolved = false 
+      ORDER BY created_at DESC
+    `);
+    return result.rows;
+  } catch (error) {
+    console.error('Error getting active markets:', error);
+    throw error;
+  }
 }
 
 // Perfect stake formula
@@ -54,18 +217,18 @@ function updateMarketProbability(current_stakes, current_probs, new_stake, new_p
 }
 
 // Perfect placeBet core logic
-function placeBet(market_id, user_id, desired_amount, probability) {
+async function placeBet(market_id, user_id, desired_amount, probability) {
     // Validation
     if (probability < 0 || probability > 1) {
         throw new Error("Probability must be between 0 and 1");
     }
     
-    const market = markets.get(market_id);
+    const market = await getMarket(market_id);
     if (!market || !market.active) {
         throw new Error("Market not found or inactive");
     }
     
-    if (new Date() > market.deadline) {
+    if (new Date() > new Date(market.deadline)) {
         throw new Error("Market has expired");
     }
     
@@ -73,17 +236,19 @@ function placeBet(market_id, user_id, desired_amount, probability) {
     const stake = calculateStake(desired_amount);
     
     // Check user bankroll
-    const user = initializeUser(user_id);
-    const old_bet = market.bets.find(bet => bet.userId === user_id);
-    const available_bankroll = user.bankroll - user.totalStaked + (old_bet ? old_bet.stake : 0);
+    const user = await getUser(user_id);
+    const old_bet = await getUserBet(market_id, user_id);
+    const available_bankroll = user.bankroll - user.total_staked + (old_bet ? old_bet.stake : 0);
     
     if (stake > available_bankroll) {
         throw new Error(`Insufficient bankroll. Available: $${available_bankroll}`);
     }
     
-    // Get current state for probability calculation
-    const current_stakes = market.bets.map(bet => bet.stake);
-    const current_probs = market.bets.map(bet => bet.probability);
+    // Get current state for probability calculation (excluding the bet being updated)
+    const all_bets = await getMarketBets(market_id);
+    const other_bets = all_bets.filter(bet => bet.user_id !== user_id);
+    const current_stakes = other_bets.map(bet => parseInt(bet.stake));
+    const current_probs = other_bets.map(bet => parseFloat(bet.probability));
     
     // Update market probability
     const new_prob = updateMarketProbability(
@@ -91,48 +256,48 @@ function placeBet(market_id, user_id, desired_amount, probability) {
         current_probs, 
         stake, 
         probability,
-        old_bet?.stake || 0,
-        old_bet?.probability || 0
+        0, // No old bet to remove since we filtered it out
+        0
     );
     
-    // Update market data
+    // Calculate new total stake
     const old_stake = old_bet ? old_bet.stake : 0;
-    const existingBetIndex = market.bets.findIndex(bet => bet.userId === user_id);
+    const new_total_stake = market.total_stake - old_stake + stake;
     
-    if (existingBetIndex >= 0) {
-        // Update existing bet
-        market.bets[existingBetIndex] = { 
-            userId: user_id, 
-            stake: stake, 
-            probability: probability, 
-            timestamp: new Date() 
-        };
-    } else {
-        // New bet
-        market.bets.push({ 
-            userId: user_id, 
-            stake: stake, 
-            probability: probability, 
-            timestamp: new Date() 
+    // Update database in transaction
+    try {
+        await pool.query('BEGIN');
+        
+        // Update bet
+        await upsertBet(market_id, user_id, stake, probability);
+        
+        // Update market
+        await updateMarket(market_id, {
+            probability: new_prob,
+            total_stake: new_total_stake
         });
+        
+        // Update user
+        const net_stake_change = stake - old_stake;
+        await updateUser(user_id, {
+            total_staked: user.total_staked + net_stake_change
+        });
+        
+        await pool.query('COMMIT');
+        
+        return {
+            stake_placed: stake,
+            new_market_probability: new_prob,
+            was_capped: stake < desired_amount,
+            message: stake < desired_amount ? `Bet capped at $${stake} (max: $100)` : `Bet placed: $${stake}`,
+            user: await getUser(user_id),
+            market: await getMarket(market_id)
+        };
+        
+    } catch (error) {
+        await pool.query('ROLLBACK');
+        throw error;
     }
-    
-    // Update totals
-    market.totalStake = market.totalStake - old_stake + stake;
-    market.probability = new_prob;
-    
-    // Update user bankroll
-    const net_stake_change = stake - old_stake;
-    user.totalStaked += net_stake_change;
-    
-    return {
-        stake_placed: stake,
-        new_market_probability: new_prob,
-        was_capped: stake < desired_amount,
-        message: stake < desired_amount ? `Bet capped at $${stake} (max: $100)` : `Bet placed: $${stake}`,
-        user: user,
-        market: market
-    };
 }
 
 // Show help menu
@@ -182,21 +347,13 @@ function getHelpMenu() {
 
 // Parse market creation from natural language
 function parseMarketCreation(text) {
-  // Handle various formats:
-  // "Will we ship X by Friday? | 2025-06-20"
-  // "create Will we ship X by Friday? | 2025-06-20"
-  // "Will we ship X by Friday - 50% chance"
-  
-  let cleanText = text.replace(/^create\s+/i, ''); // Remove "create" if present
+  let cleanText = text.replace(/^create\s+/i, '');
   
   if (cleanText.includes('|')) {
-    // Standard format: Question | Date
     const [question, dateStr] = cleanText.split('|').map(s => s.trim());
     return { question, deadline: dateStr };
   } else if (cleanText.includes(' - ') && cleanText.includes('% chance')) {
-    // Format: Question - XX% chance
     const question = cleanText.split(' - ')[0].trim();
-    // Default to 7 days from now
     const deadline = new Date();
     deadline.setDate(deadline.getDate() + 7);
     return { question, deadline: deadline.toISOString().split('T')[0] };
@@ -207,25 +364,17 @@ function parseMarketCreation(text) {
 
 // Parse betting from natural language
 function parseBetting(text) {
-  // Handle various formats:
-  // "bet market_123 75 50" (probability, stake)
-  // "market_123 75% $50"
-  // "market_123 likely 25"
-  
   const parts = text.split(' ');
   if (parts.length < 3) return null;
   
   let marketId, probability, stake;
   
   if (parts[0] === 'bet') {
-    // Standard format: bet market_id probability stake
     [, marketId, probability, stake] = parts;
   } else {
-    // Short format: market_id probability stake
     [marketId, probability, stake] = parts;
   }
   
-  // Convert probability
   if (typeof probability === 'string') {
     probability = probability.replace('%', '');
     if (probability === 'likely') probability = '75';
@@ -241,7 +390,7 @@ function parseBetting(text) {
   
   return {
     marketId,
-    probability: prob > 1 ? prob / 100 : prob, // Convert percentage to decimal
+    probability: prob > 1 ? prob / 100 : prob,
     stake: amount
   };
 }
@@ -279,20 +428,17 @@ app.command('/predict', async ({ command, ack, respond }) => {
         return;
       }
       
-      const market = {
+      const marketData = {
         id: marketId,
         question: parsed.question,
         creator: command.user_id,
-        created: new Date(),
         deadline: deadline,
-        resolved: false,
         probability: 0.5,
         totalStake: 0,
-        bets: [],
         active: true
       };
       
-      markets.set(marketId, market);
+      await createMarket(marketData);
       
       await respond({
         response_type: 'in_channel',
@@ -362,11 +508,11 @@ app.command('/predict', async ({ command, ack, respond }) => {
     }
     
     try {
-      const result = placeBet(parsed.marketId, command.user_id, parsed.stake, parsed.probability);
+      const result = await placeBet(parsed.marketId, command.user_id, parsed.stake, parsed.probability);
       
       await respond({
         response_type: 'ephemeral',
-        text: `✅ ${result.message}\n\n📊 Market: *${(result.new_market_probability * 100).toFixed(1)}%*\n💰 Available: $${result.user.bankroll - result.user.totalStaked}`
+        text: `✅ ${result.message}\n\n📊 Market: *${(result.new_market_probability * 100).toFixed(1)}%*\n💰 Available: $${result.user.bankroll - result.user.total_staked}`
       });
       
     } catch (error) {
@@ -377,73 +523,76 @@ app.command('/predict', async ({ command, ack, respond }) => {
   
   // List markets
   if (text === 'markets' || text === 'list') {
-    const activeMarkets = Array.from(markets.values())
-      .filter(m => m.active && !m.resolved)
-      .sort((a, b) => b.created - a.created);
-    
-    if (activeMarkets.length === 0) {
+    try {
+      const activeMarkets = await getActiveMarkets();
+      
+      if (activeMarkets.length === 0) {
+        await respond({
+          response_type: 'ephemeral',
+          text: '📝 No active markets. Create one with:\n`/predict create Your question? | 2025-06-20`'
+        });
+        return;
+      }
+      
+      const marketList = activeMarkets.slice(0, 5).map(market => {
+        return `🎯 *${market.question}*\n📊 ${(parseFloat(market.probability) * 100).toFixed(1)}% | $${market.total_stake} staked\n🆔 \`${market.id}\``;
+      }).join('\n\n');
+      
       await respond({
         response_type: 'ephemeral',
-        text: '📝 No active markets. Create one with:\n`/predict create Your question? | 2025-06-20`'
+        text: `📊 *Active Markets*\n\n${marketList}\n\n💡 Use \`/predict bet market_id probability stake\` to bet`
       });
-      return;
+    } catch (error) {
+      await respond(`❌ Error: ${error.message}`);
     }
-    
-    const marketList = activeMarkets.slice(0, 5).map(market => {
-      const participants = new Set(market.bets.map(bet => bet.userId)).size;
-      return `🎯 *${market.question}*\n📊 ${(market.probability * 100).toFixed(1)}% | $${market.totalStake} | ${participants} participants\n🆔 \`${market.id}\``;
-    }).join('\n\n');
-    
-    await respond({
-      response_type: 'ephemeral',
-      text: `📊 *Active Markets*\n\n${marketList}\n\n💡 Use \`/predict bet market_id probability stake\` to bet`
-    });
     return;
   }
   
   // User stats
   if (text === 'stats' || text === 'me') {
-    const user = users.get(command.user_id);
-    if (!user) {
+    try {
+      const user = await getUser(command.user_id);
+      
       await respond({
         response_type: 'ephemeral',
-        text: '📊 No betting history. Place your first bet to get started!'
+        text: `📊 *Your Stats*\n\n💰 Bankroll: $${user.bankroll}\n📈 Staked: $${user.total_staked}\n💵 Available: $${user.bankroll - user.total_staked}\n\n🏆 Bets: ${user.bets_placed} | ✅ Won: ${user.bets_won}\n📊 Accuracy: ${(parseFloat(user.accuracy) * 100).toFixed(1)}%`
       });
-      return;
+    } catch (error) {
+      await respond(`❌ Error: ${error.message}`);
     }
-    
-    await respond({
-      response_type: 'ephemeral',
-      text: `📊 *Your Stats*\n\n💰 Bankroll: $${user.bankroll}\n📈 Staked: $${user.totalStaked}\n💵 Available: $${user.bankroll - user.totalStaked}\n\n🏆 Bets: ${user.betsPlaced} | ✅ Won: ${user.betsWon}\n📊 Accuracy: ${(user.accuracy * 100).toFixed(1)}%`
-    });
     return;
   }
   
   // Market info
   if (text.startsWith('info ')) {
     const marketId = text.replace('info ', '').trim();
-    const market = markets.get(marketId);
     
-    if (!market) {
+    try {
+      const market = await getMarket(marketId);
+      if (!market) {
+        await respond({
+          response_type: 'ephemeral',
+          text: '❌ Market not found'
+        });
+        return;
+      }
+      
+      const bets = await getMarketBets(marketId);
+      const participants = new Set(bets.map(bet => bet.user_id)).size;
+      const user_bet = bets.find(bet => bet.user_id === command.user_id);
+      
+      let betDetails = '';
+      if (user_bet) {
+        betDetails = `\n🎯 Your bet: $${user_bet.stake} on ${(parseFloat(user_bet.probability) * 100).toFixed(1)}%`;
+      }
+      
       await respond({
         response_type: 'ephemeral',
-        text: '❌ Market not found'
+        text: `📊 *Market Details*\n\n*${market.question}*\n\n📈 Probability: *${(parseFloat(market.probability) * 100).toFixed(1)}%*\n💰 Total staked: $${market.total_stake}\n👥 Participants: ${participants}\n⏰ Deadline: ${new Date(market.deadline).toLocaleDateString()}${betDetails}`
       });
-      return;
+    } catch (error) {
+      await respond(`❌ Error: ${error.message}`);
     }
-    
-    const participants = new Set(market.bets.map(bet => bet.userId)).size;
-    const user_bet = market.bets.find(bet => bet.userId === command.user_id);
-    
-    let betDetails = '';
-    if (user_bet) {
-      betDetails = `\n🎯 Your bet: ${user_bet.stake} on ${(user_bet.probability * 100).toFixed(1)}%`;
-    }
-    
-    await respond({
-      response_type: 'ephemeral',
-      text: `📊 *Market Details*\n\n*${market.question}*\n\n📈 Probability: *${(market.probability * 100).toFixed(1)}%*\n💰 Total staked: ${market.totalStake}\n👥 Participants: ${participants}\n⏰ Deadline: ${market.deadline.toLocaleDateString()}${betDetails}`
-    });
     return;
   }
   
@@ -461,44 +610,60 @@ app.command('/predict', async ({ command, ack, respond }) => {
     const [marketId, outcomeStr] = args;
     const outcome = outcomeStr.toLowerCase() === 'yes';
     
-    const market = markets.get(marketId);
-    if (!market) {
-      await respond('❌ Market not found');
-      return;
+    try {
+      const market = await getMarket(marketId);
+      if (!market) {
+        await respond('❌ Market not found');
+        return;
+      }
+      
+      if (market.resolved) {
+        await respond('❌ Market already resolved');
+        return;
+      }
+      
+      // Get all bets for payout calculation
+      const bets = await getMarketBets(marketId);
+      
+      // Calculate payouts
+      const payoutPromises = bets.map(async (bet) => {
+        const user = await getUser(bet.user_id);
+        const accuracy = outcome ? parseFloat(bet.probability) : (1 - parseFloat(bet.probability));
+        const payout = Math.floor(bet.stake * (1 + accuracy));
+        
+        // Update user stats
+        const wasCorrect = (outcome && parseFloat(bet.probability) > 0.5) || (!outcome && parseFloat(bet.probability) < 0.5);
+        const newBetsWon = user.bets_won + (wasCorrect ? 1 : 0);
+        const newBetsPlaced = user.bets_placed + 1;
+        const newAccuracy = newBetsWon / newBetsPlaced;
+        
+        await updateUser(bet.user_id, {
+          bankroll: user.bankroll + payout,
+          total_staked: user.total_staked - bet.stake,
+          bets_placed: newBetsPlaced,
+          bets_won: newBetsWon,
+          accuracy: newAccuracy
+        });
+        
+        return `<@${bet.user_id}>: $${payout} (${(accuracy * 100).toFixed(1)}% accuracy)`;
+      });
+      
+      const payoutSummary = await Promise.all(payoutPromises);
+      
+      // Resolve market
+      await updateMarket(marketId, {
+        resolved: true,
+        resolution: outcome,
+        resolved_at: new Date()
+      });
+      
+      await respond({
+        response_type: 'in_channel',
+        text: `🏁 *Market Resolved!*\n\n*${market.question}*\n\n✅ **Result: ${outcome ? 'YES' : 'NO'}**\n\n💰 **Payouts:**\n${payoutSummary.join('\n')}`
+      });
+    } catch (error) {
+      await respond(`❌ Error: ${error.message}`);
     }
-    
-    if (market.resolved) {
-      await respond('❌ Market already resolved');
-      return;
-    }
-    
-    // Resolve market
-    market.resolved = true;
-    market.resolution = outcome;
-    market.resolvedAt = new Date();
-    
-    // Calculate payouts
-    let payoutSummary = [];
-    market.bets.forEach(bet => {
-      const user = users.get(bet.userId);
-      const accuracy = outcome ? bet.probability : (1 - bet.probability);
-      const payout = Math.floor(bet.stake * (1 + accuracy));
-      
-      user.bankroll += payout;
-      user.totalStaked -= bet.stake;
-      user.betsPlaced++;
-      
-      const wasCorrect = (outcome && bet.probability > 0.5) || (!outcome && bet.probability < 0.5);
-      if (wasCorrect) user.betsWon++;
-      user.accuracy = user.betsWon / user.betsPlaced;
-      
-      payoutSummary.push(`<@${bet.userId}>: ${payout} (${(accuracy * 100).toFixed(1)}% accuracy)`);
-    });
-    
-    await respond({
-      response_type: 'in_channel',
-      text: `🏁 *Market Resolved!*\n\n*${market.question}*\n\n✅ **Result: ${outcome ? 'YES' : 'NO'}**\n\n💰 **Payouts:**\n${payoutSummary.join('\n')}`
-    });
     return;
   }
   
@@ -518,40 +683,38 @@ app.action(/^bet_quick_/, async ({ action, ack, respond, body }) => {
   console.log('Action split:', action.action_id.split('_'));
   
   const parts = action.action_id.split('_');
-  const marketId = parts.slice(2, -1).join('_'); // Handle market IDs with underscores
+  const marketId = parts.slice(2, -1).join('_');
   const probability = parts[parts.length - 1];
   
   console.log('Extracted market ID:', marketId);
   console.log('Extracted probability:', probability);
-  console.log('Available markets:', Array.from(markets.keys()));
-  console.log('Market exists?', markets.has(marketId));
   
   const userId = body.user.id;
   const default_amount = 25; // $25 quick bet
   
-  const market = markets.get(marketId);
-  if (!market || !market.active) {
-    await respond({
-      response_type: 'ephemeral',
-      text: `❌ Debug: Looking for '${marketId}', available: ${Array.from(markets.keys()).join(', ')}`
-    });
-    return;
-  }
-  
-  if (new Date() > market.deadline) {
-    await respond({
-      response_type: 'ephemeral',
-      text: '❌ Market has expired'
-    });
-    return;
-  }
-  
   try {
-    const result = placeBet(marketId, userId, default_amount, parseFloat(probability));
+    const market = await getMarket(marketId);
+    if (!market || !market.active) {
+      await respond({
+        response_type: 'ephemeral',
+        text: '❌ Market not found or inactive'
+      });
+      return;
+    }
+    
+    if (new Date() > new Date(market.deadline)) {
+      await respond({
+        response_type: 'ephemeral',
+        text: '❌ Market has expired'
+      });
+      return;
+    }
+    
+    const result = await placeBet(marketId, userId, default_amount, parseFloat(probability));
     
     await respond({
       response_type: 'ephemeral',
-      text: `✅ Quick bet: ${result.stake_placed} on ${(parseFloat(probability) * 100).toFixed(0)}%\n\n📊 Market: *${(result.new_market_probability * 100).toFixed(1)}%*`
+      text: `✅ Quick bet: $${result.stake_placed} on ${(parseFloat(probability) * 100).toFixed(0)}%\n\n📊 Market: *${(result.new_market_probability * 100).toFixed(1)}%*`
     });
     
   } catch (error) {
@@ -564,6 +727,11 @@ app.action(/^bet_quick_/, async ({ action, ack, respond, body }) => {
 
 // Start the app
 (async () => {
-  await app.start();
-  console.log('⚡️ Prediction Market Bot (/predict) is running!');
+  try {
+    await initializeDatabase();
+    await app.start();
+    console.log('⚡️ Prediction Market Bot with PostgreSQL is running!');
+  } catch (error) {
+    console.error('Failed to start app:', error);
+  }
 })();
