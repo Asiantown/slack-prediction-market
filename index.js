@@ -1,4 +1,12 @@
 require('dotenv').config();
+
+// Debug logging
+console.log('=== ENVIRONMENT VARIABLES DEBUG ===');
+console.log('SLACK_BOT_TOKEN:', process.env.SLACK_BOT_TOKEN ? 'EXISTS' : 'MISSING');
+console.log('SLACK_SIGNING_SECRET:', process.env.SLACK_SIGNING_SECRET ? 'EXISTS' : 'MISSING');
+console.log('SLACK_APP_TOKEN:', process.env.SLACK_APP_TOKEN ? 'EXISTS' : 'MISSING');
+console.log('===============================');
+
 const { App } = require('@slack/bolt');
 
 const app = new App({
