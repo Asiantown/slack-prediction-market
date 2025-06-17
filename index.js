@@ -549,7 +549,7 @@ function getHelpMenu(isAdmin = false) {
     type: "section",
     text: {
       type: "mrkdwn",
-      text: "*🔧 Admin Commands:*\n`/predict resolve market_123 yes|no` - Resolve markets and distribute payouts"
+      text: "*🔧 Admin Commands:*\n`/predict resolve market_123 yes|no` - Resolve markets and distribute payouts\n`/predict resetstats` - Reset your stats to starting values\n`/predict fixstats` - Manually fix leaderboard stats"
     }
   } : null;
 
@@ -769,6 +769,63 @@ app.command('/predict', async ({ command, ack, respond }) => {
       });
     } catch (error) {
       await respond(`❌ Error: ${error.message}`);
+    }
+    return;
+  }
+  
+  // Admin reset stats command
+  if (text.startsWith('resetstats') && isAdmin) {
+    try {
+      const userId = command.user_id;
+      
+      // Reset all stats to starting values
+      await pool.query(`
+        UPDATE users SET 
+          bankroll = 1000,
+          total_staked = 0,
+          bets_placed = 0,
+          bets_won = 0,
+          accuracy = 0.5,
+          total_profit = 0,
+          biggest_win = 0,
+          prediction_streak = 0,
+          best_streak = 0,
+          markets_created = 0
+        WHERE id = $1
+      `, [userId]);
+      
+      await respond({
+        response_type: 'ephemeral',
+        text: '✅ All stats reset to starting values! Fresh start for demo.'
+      });
+    } catch (error) {
+      await respond(`❌ Error resetting stats: ${error.message}`);
+    }
+    return;
+  }
+  
+  // Admin fix stats command (temporary)
+  if (text.startsWith('fixstats') && isAdmin) {
+    try {
+      const userId = command.user_id;
+      
+      // Manually update your stats to correct values
+      await pool.query(`
+        UPDATE users SET 
+          total_profit = 41,
+          biggest_win = 100,
+          prediction_streak = 1,
+          best_streak = 1,
+          markets_created = 1
+        WHERE id = $1
+      `, [userId]);
+      
+      await respond({
+        response_type: 'ephemeral',
+        text: '✅ Stats manually fixed! Try `/predict leaderboard profit` now.'
+      });
+    } catch (error) {
+      await respond(`❌ Error fixing stats: ${error.message}`);
     }
     return;
   }
