@@ -48,6 +48,26 @@ async function initializeDatabase() {
       )
     `);
 
+    // Add new columns to existing users table if they don't exist
+    const alterQueries = [
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS total_profit INTEGER DEFAULT 0`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS biggest_win INTEGER DEFAULT 0`, 
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS prediction_streak INTEGER DEFAULT 0`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS best_streak INTEGER DEFAULT 0`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS markets_created INTEGER DEFAULT 0`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP`,
+      `ALTER TABLE users ALTER COLUMN accuracy TYPE DECIMAL(5,4)`
+    ];
+
+    for (const query of alterQueries) {
+      try {
+        await pool.query(query);
+      } catch (error) {
+        // Ignore errors for columns that already exist
+        console.log('Column may already exist:', error.message);
+      }
+    }
+
     // Create markets table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS markets (
