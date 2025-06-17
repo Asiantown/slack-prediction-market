@@ -17,6 +17,9 @@ const app = new App({
   appToken: process.env.SLACK_APP_TOKEN
 });
 
+// Admin user ID - CHANGE THIS TO YOUR SLACK USER ID
+const ADMIN_USER_ID = process.env.ADMIN_USER_ID || 'U07HDDVPL1S'; // Replace with your actual user ID
+
 // PostgreSQL connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -300,48 +303,68 @@ async function placeBet(market_id, user_id, desired_amount, probability) {
     }
 }
 
-// Show help menu
-function getHelpMenu() {
+// Show help menu (different for admin vs regular users)
+function getHelpMenu(isAdmin = false) {
+  const adminSection = isAdmin ? {
+    type: "section",
+    text: {
+      type: "mrkdwn",
+      text: "*🔧 Admin Commands:*\n`/predict resolve market_123 yes|no` - Resolve markets and distribute payouts"
+    }
+  } : null;
+
+  const blocks = [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: "🎯 *Prediction Market Bot Help*\n\nCreate binary prediction markets and bet on outcomes with your team!"
+      }
+    },
+    {
+      type: "divider"
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: "*📝 Create Markets:*\n`/predict create Will we ship Feature X by Friday? | 2025-06-20`\n\n*💰 Place Bets:*\n`/predict bet market_123 75 50` (75% probability, $50 stake)\n\n*📊 View Markets:*\n`/predict markets` - List all active markets\n\n*📈 Your Stats:*\n`/predict stats` - View your performance\n\n*ℹ️ Market Info:*\n`/predict info market_123` - Detailed market view"
+      }
+    }
+  ];
+
+  if (adminSection) {
+    blocks.push({
+      type: "divider"
+    });
+    blocks.push(adminSection);
+  }
+
+  blocks.push(
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: "*🎮 Quick Tips:*\n• Everyone starts with $1000\n• Bet range: $1-$100\n• Probability: 0-100 (e.g., 75 = 75%)\n• Bigger bets = more market influence\n• Markets resolve manually by admin"
+      }
+    },
+    {
+      type: "divider"
+    },
+    {
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: "💡 *Pro tip:* Use quick bet buttons on markets for instant betting!"
+        }
+      ]
+    }
+  );
+
   return {
     response_type: 'ephemeral',
-    blocks: [
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text: "🎯 *Prediction Market Bot Help*\n\nCreate binary prediction markets and bet on outcomes with your team!"
-        }
-      },
-      {
-        type: "divider"
-      },
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text: "*📝 Create Markets:*\n`/predict create Will we ship Feature X by Friday? | 2025-06-20`\n\n*💰 Place Bets:*\n`/predict bet market_123 75 50` (75% probability, $50 stake)\n\n*📊 View Markets:*\n`/predict markets` - List all active markets\n\n*📈 Your Stats:*\n`/predict stats` - View your performance\n\n*ℹ️ Market Info:*\n`/predict info market_123` - Detailed market view"
-        }
-      },
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text: "*🎮 Quick Tips:*\n• Everyone starts with $1000\n• Bet range: $1-$100\n• Probability: 0-100 (e.g., 75 = 75%)\n• Bigger bets = more market influence\n• Markets auto-resolve on deadline"
-        }
-      },
-      {
-        type: "divider"
-      },
-      {
-        type: "context",
-        elements: [
-          {
-            type: "mrkdwn",
-            text: "💡 *Pro tip:* Use quick bet buttons on markets for instant betting!"
-          }
-        ]
-      }
-    ]
+    blocks: blocks
   };
 }
 
@@ -400,10 +423,95 @@ app.command('/predict', async ({ command, ack, respond }) => {
   await ack();
   
   const text = command.text.trim().toLowerCase();
+  const isAdmin = command.user_id === ADMIN_USER_ID;
   
   // Help menu
   if (!text || text === 'help') {
-    await respond(getHelpMenu());
+    await respond(getHelpMenu(isAdmin));
+    return;
+  }
+  
+  // Resolve market (admin only) - CHECK FIRST!
+  if (text.startsWith('resolve ')) {
+    if (!isAdmin) {
+      await respond({
+        response_type: 'ephemeral',
+        text: '❌ Only admins can resolve markets'
+      });
+      return;
+    }
+    
+    const args = text.replace('resolve ', '').split(' ');
+    if (args.length < 2) {
+      await respond({
+        response_type: 'ephemeral',
+        text: '❌ Usage: `/predict resolve market_id yes|no`'
+      });
+      return;
+    }
+    
+    const [marketId, outcomeStr] = args;
+    const outcome = outcomeStr.toLowerCase() === 'yes';
+    
+    try {
+      const market = await getMarket(marketId);
+      if (!market) {
+        await respond('❌ Market not found');
+        return;
+      }
+      
+      if (market.resolved) {
+        await respond('❌ Market already resolved');
+        return;
+      }
+      
+      // Get all bets for payout calculation
+      const bets = await getMarketBets(marketId);
+      
+      if (bets.length === 0) {
+        await respond('❌ No bets placed on this market');
+        return;
+      }
+      
+      // Calculate payouts
+      const payoutPromises = bets.map(async (bet) => {
+        const user = await getUser(bet.user_id);
+        const accuracy = outcome ? parseFloat(bet.probability) : (1 - parseFloat(bet.probability));
+        const payout = Math.floor(bet.stake * (1 + accuracy));
+        
+        // Update user stats
+        const wasCorrect = (outcome && parseFloat(bet.probability) > 0.5) || (!outcome && parseFloat(bet.probability) < 0.5);
+        const newBetsWon = user.bets_won + (wasCorrect ? 1 : 0);
+        const newBetsPlaced = user.bets_placed + 1;
+        const newAccuracy = newBetsWon / newBetsPlaced;
+        
+        await updateUser(bet.user_id, {
+          bankroll: user.bankroll + payout,
+          total_staked: user.total_staked - bet.stake,
+          bets_placed: newBetsPlaced,
+          bets_won: newBetsWon,
+          accuracy: newAccuracy
+        });
+        
+        return `<@${bet.user_id}>: $${payout} (${(accuracy * 100).toFixed(1)}% accuracy)`;
+      });
+      
+      const payoutSummary = await Promise.all(payoutPromises);
+      
+      // Resolve market
+      await updateMarket(marketId, {
+        resolved: true,
+        resolution: outcome,
+        resolved_at: new Date()
+      });
+      
+      await respond({
+        response_type: 'in_channel',
+        text: `🏁 *Market Resolved!*\n\n*${market.question}*\n\n✅ **Result: ${outcome ? 'YES' : 'NO'}**\n\n💰 **Payouts:**\n${payoutSummary.join('\n')}`
+      });
+    } catch (error) {
+      await respond(`❌ Error: ${error.message}`);
+    }
     return;
   }
   
@@ -596,77 +704,6 @@ app.command('/predict', async ({ command, ack, respond }) => {
     return;
   }
   
-  // Resolve market (admin command)
-  if (text.startsWith('resolve ')) {
-    const args = text.replace('resolve ', '').split(' ');
-    if (args.length < 2) {
-      await respond({
-        response_type: 'ephemeral',
-        text: '❌ Usage: `/predict resolve market_id yes|no`'
-      });
-      return;
-    }
-    
-    const [marketId, outcomeStr] = args;
-    const outcome = outcomeStr.toLowerCase() === 'yes';
-    
-    try {
-      const market = await getMarket(marketId);
-      if (!market) {
-        await respond('❌ Market not found');
-        return;
-      }
-      
-      if (market.resolved) {
-        await respond('❌ Market already resolved');
-        return;
-      }
-      
-      // Get all bets for payout calculation
-      const bets = await getMarketBets(marketId);
-      
-      // Calculate payouts
-      const payoutPromises = bets.map(async (bet) => {
-        const user = await getUser(bet.user_id);
-        const accuracy = outcome ? parseFloat(bet.probability) : (1 - parseFloat(bet.probability));
-        const payout = Math.floor(bet.stake * (1 + accuracy));
-        
-        // Update user stats
-        const wasCorrect = (outcome && parseFloat(bet.probability) > 0.5) || (!outcome && parseFloat(bet.probability) < 0.5);
-        const newBetsWon = user.bets_won + (wasCorrect ? 1 : 0);
-        const newBetsPlaced = user.bets_placed + 1;
-        const newAccuracy = newBetsWon / newBetsPlaced;
-        
-        await updateUser(bet.user_id, {
-          bankroll: user.bankroll + payout,
-          total_staked: user.total_staked - bet.stake,
-          bets_placed: newBetsPlaced,
-          bets_won: newBetsWon,
-          accuracy: newAccuracy
-        });
-        
-        return `<@${bet.user_id}>: $${payout} (${(accuracy * 100).toFixed(1)}% accuracy)`;
-      });
-      
-      const payoutSummary = await Promise.all(payoutPromises);
-      
-      // Resolve market
-      await updateMarket(marketId, {
-        resolved: true,
-        resolution: outcome,
-        resolved_at: new Date()
-      });
-      
-      await respond({
-        response_type: 'in_channel',
-        text: `🏁 *Market Resolved!*\n\n*${market.question}*\n\n✅ **Result: ${outcome ? 'YES' : 'NO'}**\n\n💰 **Payouts:**\n${payoutSummary.join('\n')}`
-      });
-    } catch (error) {
-      await respond(`❌ Error: ${error.message}`);
-    }
-    return;
-  }
-  
   // Default: show help if command not recognized
   await respond({
     response_type: 'ephemeral',
@@ -730,7 +767,8 @@ app.action(/^bet_quick_/, async ({ action, ack, respond, body }) => {
   try {
     await initializeDatabase();
     await app.start();
-    console.log('⚡️ Prediction Market Bot with PostgreSQL is running!');
+    console.log('⚡️ Prediction Market Bot with Admin-Only Resolve is running!');
+    console.log(`🔑 Admin User ID: ${ADMIN_USER_ID}`);
   } catch (error) {
     console.error('Failed to start app:', error);
   }
