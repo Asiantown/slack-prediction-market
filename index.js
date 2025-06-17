@@ -798,10 +798,12 @@ app.command('/predict', async ({ command, ack, respond }) => {
           bets_placed: newBetsPlaced,
           bets_won: newBetsWon,
           accuracy: newAccuracy,
-          total_profit: user.total_profit + profit,
-          biggest_win: newBiggestWin,
-          prediction_streak: newStreak,
-          best_streak: newBestStreak
+          ...(user.total_profit !== undefined && {
+            total_profit: (user.total_profit || 0) + profit,
+            biggest_win: Math.max(user.biggest_win || 0, payout),
+            prediction_streak: newStreak,
+            best_streak: newBestStreak
+          })
         });
         
         return `<@${bet.user_id}>: $${payout} (${(accuracy * 100).toFixed(1)}% accuracy)`;
