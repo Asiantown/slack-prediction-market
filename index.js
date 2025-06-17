@@ -18,7 +18,7 @@ const app = new App({
 });
 
 // Admin user ID - CHANGE THIS TO YOUR SLACK USER ID
-const ADMIN_USER_ID = process.env.ADMIN_USER_ID || 'U07HDDVPL1S'; // Replace with your actual user ID
+const ADMIN_USER_ID = process.env.ADMIN_USER_ID || 'U08QVDK2Z4L'; // Ryan's user ID
 
 // PostgreSQL connection
 const pool = new Pool({
