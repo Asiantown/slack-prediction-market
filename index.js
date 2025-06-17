@@ -249,11 +249,15 @@ async function getActiveMarkets() {
   }
 }
 
-// Leaderboard queries
+// Leaderboard queries (safe fallbacks for missing columns)
 async function getLeaderboardByAccuracy(limit = 10) {
   try {
     const result = await pool.query(`
-      SELECT id, bankroll, bets_placed, bets_won, accuracy, total_profit, prediction_streak, best_streak, markets_created
+      SELECT id, bankroll, bets_placed, bets_won, accuracy,
+             COALESCE(total_profit, 0) as total_profit,
+             COALESCE(prediction_streak, 0) as prediction_streak,
+             COALESCE(best_streak, 0) as best_streak,
+             COALESCE(markets_created, 0) as markets_created
       FROM users 
       WHERE bets_placed >= 3
       ORDER BY accuracy DESC, bets_placed DESC 
@@ -262,55 +266,135 @@ async function getLeaderboardByAccuracy(limit = 10) {
     return result.rows;
   } catch (error) {
     console.error('Error getting accuracy leaderboard:', error);
-    throw error;
+    // Fallback to basic query if new columns don't exist
+    try {
+      const result = await pool.query(`
+        SELECT id, bankroll, bets_placed, bets_won, accuracy
+        FROM users 
+        WHERE bets_placed >= 3
+        ORDER BY accuracy DESC, bets_placed DESC 
+        LIMIT $1
+      `, [limit]);
+      return result.rows.map(row => ({
+        ...row,
+        total_profit: 0,
+        prediction_streak: 0,
+        best_streak: 0,
+        markets_created: 0
+      }));
+    } catch (fallbackError) {
+      console.error('Fallback query failed:', fallbackError);
+      throw fallbackError;
+    }
   }
 }
 
 async function getLeaderboardByProfit(limit = 10) {
   try {
     const result = await pool.query(`
-      SELECT id, bankroll, bets_placed, bets_won, accuracy, total_profit, biggest_win, prediction_streak, best_streak
+      SELECT id, bankroll, bets_placed, bets_won, accuracy,
+             COALESCE(total_profit, 0) as total_profit,
+             COALESCE(biggest_win, 0) as biggest_win,
+             COALESCE(prediction_streak, 0) as prediction_streak,
+             COALESCE(best_streak, 0) as best_streak
       FROM users 
       WHERE bets_placed >= 1
-      ORDER BY total_profit DESC, bankroll DESC 
+      ORDER BY COALESCE(total_profit, 0) DESC, bankroll DESC 
       LIMIT $1
     `, [limit]);
     return result.rows;
   } catch (error) {
     console.error('Error getting profit leaderboard:', error);
-    throw error;
+    // Fallback: rank by bankroll
+    try {
+      const result = await pool.query(`
+        SELECT id, bankroll, bets_placed, bets_won, accuracy
+        FROM users 
+        WHERE bets_placed >= 1
+        ORDER BY bankroll DESC 
+        LIMIT $1
+      `, [limit]);
+      return result.rows.map(row => ({
+        ...row,
+        total_profit: row.bankroll - 1000, // Estimate profit
+        biggest_win: 0,
+        prediction_streak: 0,
+        best_streak: 0
+      }));
+    } catch (fallbackError) {
+      console.error('Fallback query failed:', fallbackError);
+      throw fallbackError;
+    }
   }
 }
 
 async function getLeaderboardByVolume(limit = 10) {
   try {
     const result = await pool.query(`
-      SELECT id, bankroll, bets_placed, bets_won, accuracy, total_profit, markets_created
+      SELECT id, bankroll, bets_placed, bets_won, accuracy,
+             COALESCE(total_profit, 0) as total_profit,
+             COALESCE(markets_created, 0) as markets_created
       FROM users 
       WHERE bets_placed >= 1
-      ORDER BY bets_placed DESC, markets_created DESC 
+      ORDER BY bets_placed DESC, COALESCE(markets_created, 0) DESC 
       LIMIT $1
     `, [limit]);
     return result.rows;
   } catch (error) {
     console.error('Error getting volume leaderboard:', error);
-    throw error;
+    // Fallback to basic query
+    try {
+      const result = await pool.query(`
+        SELECT id, bankroll, bets_placed, bets_won, accuracy
+        FROM users 
+        WHERE bets_placed >= 1
+        ORDER BY bets_placed DESC 
+        LIMIT $1
+      `, [limit]);
+      return result.rows.map(row => ({
+        ...row,
+        total_profit: 0,
+        markets_created: 0
+      }));
+    } catch (fallbackError) {
+      console.error('Fallback query failed:', fallbackError);
+      throw fallbackError;
+    }
   }
 }
 
 async function getLeaderboardByStreak(limit = 10) {
   try {
     const result = await pool.query(`
-      SELECT id, bankroll, bets_placed, bets_won, accuracy, prediction_streak, best_streak
+      SELECT id, bankroll, bets_placed, bets_won, accuracy,
+             COALESCE(prediction_streak, 0) as prediction_streak,
+             COALESCE(best_streak, 0) as best_streak
       FROM users 
       WHERE bets_placed >= 1
-      ORDER BY best_streak DESC, prediction_streak DESC, accuracy DESC 
+      ORDER BY COALESCE(best_streak, 0) DESC, COALESCE(prediction_streak, 0) DESC, accuracy DESC 
       LIMIT $1
     `, [limit]);
     return result.rows;
   } catch (error) {
     console.error('Error getting streak leaderboard:', error);
-    throw error;
+    // Fallback to accuracy ranking
+    try {
+      const result = await pool.query(`
+        SELECT id, bankroll, bets_placed, bets_won, accuracy
+        FROM users 
+        WHERE bets_placed >= 1
+        ORDER BY accuracy DESC 
+        LIMIT $1
+      `, [limit]);
+      return result.rows.map(row => ({
+        ...row,
+        prediction_streak: 0,
+        best_streak: 0
+      }));
+    } catch (fallbackError) {
+      console.error('Fallback query failed:', fallbackError);
+      throw fallbackError;
+    }
   }
 }
 
