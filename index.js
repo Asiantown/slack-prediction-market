@@ -17,7 +17,7 @@ const app = new App({
   appToken: process.env.SLACK_APP_TOKEN
 });
 
-// Admin user ID - CHANGE THIS TO YOUR SLACK USER ID
+// Admin user ID
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID || 'U08QVDK2Z4L'; // Ryan's user ID
 
 // PostgreSQL connection
@@ -29,7 +29,7 @@ const pool = new Pool({
 // Initialize database tables
 async function initializeDatabase() {
   try {
-    // Create users table
+    // Create users table with leaderboard fields
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id VARCHAR(255) PRIMARY KEY,
@@ -37,8 +37,14 @@ async function initializeDatabase() {
         total_staked INTEGER DEFAULT 0,
         bets_placed INTEGER DEFAULT 0,
         bets_won INTEGER DEFAULT 0,
-        accuracy DECIMAL(3,2) DEFAULT 0.5,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        accuracy DECIMAL(5,4) DEFAULT 0.5,
+        total_profit INTEGER DEFAULT 0,
+        biggest_win INTEGER DEFAULT 0,
+        prediction_streak INTEGER DEFAULT 0,
+        best_streak INTEGER DEFAULT 0,
+        markets_created INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
@@ -86,10 +92,22 @@ async function getUser(userId) {
     if (result.rows.length === 0) {
       // Create new user
       await pool.query(`
-        INSERT INTO users (id, bankroll, total_staked, bets_placed, bets_won, accuracy)
-        VALUES ($1, 1000, 0, 0, 0, 0.5)
+        INSERT INTO users (id, bankroll, total_staked, bets_placed, bets_won, accuracy, total_profit, biggest_win, prediction_streak, best_streak, markets_created, last_active)
+        VALUES ($1, 1000, 0, 0, 0, 0.5, 0, 0, 0, 0, 0, CURRENT_TIMESTAMP)
       `, [userId]);
-      return { id: userId, bankroll: 1000, total_staked: 0, bets_placed: 0, bets_won: 0, accuracy: 0.5 };
+      return { 
+        id: userId, 
+        bankroll: 1000, 
+        total_staked: 0, 
+        bets_placed: 0, 
+        bets_won: 0, 
+        accuracy: 0.5,
+        total_profit: 0,
+        biggest_win: 0,
+        prediction_streak: 0,
+        best_streak: 0,
+        markets_created: 0
+      };
     }
     return result.rows[0];
   } catch (error) {
@@ -100,6 +118,9 @@ async function getUser(userId) {
 
 async function updateUser(userId, updates) {
   try {
+    // Always update last_active
+    updates.last_active = new Date();
+    
     const fields = Object.keys(updates).map((key, index) => `${key} = $${index + 2}`).join(', ');
     const values = [userId, ...Object.values(updates)];
     await pool.query(`UPDATE users SET ${fields} WHERE id = $1`, values);
@@ -133,6 +154,13 @@ async function createMarket(marketData) {
       marketData.totalStake,
       marketData.active
     ]);
+
+    // Update creator's markets_created count
+    await pool.query(`
+      UPDATE users 
+      SET markets_created = markets_created + 1, last_active = CURRENT_TIMESTAMP 
+      WHERE id = $1
+    `, [marketData.creator]);
   } catch (error) {
     console.error('Error creating market:', error);
     throw error;
@@ -201,6 +229,71 @@ async function getActiveMarkets() {
   }
 }
 
+// Leaderboard queries
+async function getLeaderboardByAccuracy(limit = 10) {
+  try {
+    const result = await pool.query(`
+      SELECT id, bankroll, bets_placed, bets_won, accuracy, total_profit, prediction_streak, best_streak, markets_created
+      FROM users 
+      WHERE bets_placed >= 3
+      ORDER BY accuracy DESC, bets_placed DESC 
+      LIMIT $1
+    `, [limit]);
+    return result.rows;
+  } catch (error) {
+    console.error('Error getting accuracy leaderboard:', error);
+    throw error;
+  }
+}
+
+async function getLeaderboardByProfit(limit = 10) {
+  try {
+    const result = await pool.query(`
+      SELECT id, bankroll, bets_placed, bets_won, accuracy, total_profit, biggest_win, prediction_streak, best_streak
+      FROM users 
+      WHERE bets_placed >= 1
+      ORDER BY total_profit DESC, bankroll DESC 
+      LIMIT $1
+    `, [limit]);
+    return result.rows;
+  } catch (error) {
+    console.error('Error getting profit leaderboard:', error);
+    throw error;
+  }
+}
+
+async function getLeaderboardByVolume(limit = 10) {
+  try {
+    const result = await pool.query(`
+      SELECT id, bankroll, bets_placed, bets_won, accuracy, total_profit, markets_created
+      FROM users 
+      WHERE bets_placed >= 1
+      ORDER BY bets_placed DESC, markets_created DESC 
+      LIMIT $1
+    `, [limit]);
+    return result.rows;
+  } catch (error) {
+    console.error('Error getting volume leaderboard:', error);
+    throw error;
+  }
+}
+
+async function getLeaderboardByStreak(limit = 10) {
+  try {
+    const result = await pool.query(`
+      SELECT id, bankroll, bets_placed, bets_won, accuracy, prediction_streak, best_streak
+      FROM users 
+      WHERE bets_placed >= 1
+      ORDER BY best_streak DESC, prediction_streak DESC, accuracy DESC 
+      LIMIT $1
+    `, [limit]);
+    return result.rows;
+  } catch (error) {
+    console.error('Error getting streak leaderboard:', error);
+    throw error;
+  }
+}
+
 // Perfect stake formula
 function calculateStake(desired_amount) {
     return Math.min(Math.max(desired_amount, 1), 100); // $1 min, $100 max
@@ -219,7 +312,7 @@ function updateMarketProbability(current_stakes, current_probs, new_stake, new_p
     return new_total === 0 ? 0.5 : weighted_sum / new_total;
 }
 
-// Perfect placeBet core logic
+// Perfect placeBet core logic with leaderboard tracking
 async function placeBet(market_id, user_id, desired_amount, probability) {
     // Validation
     if (probability < 0 || probability > 1) {
@@ -328,7 +421,7 @@ function getHelpMenu(isAdmin = false) {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "*📝 Create Markets:*\n`/predict create Will we ship Feature X by Friday? | 2025-06-20`\n\n*💰 Place Bets:*\n`/predict bet market_123 75 50` (75% probability, $50 stake)\n\n*📊 View Markets:*\n`/predict markets` - List all active markets\n\n*📈 Your Stats:*\n`/predict stats` - View your performance\n\n*ℹ️ Market Info:*\n`/predict info market_123` - Detailed market view"
+        text: "*📝 Create Markets:*\n`/predict create Will we ship Feature X by Friday? | 2025-06-20`\n\n*💰 Place Bets:*\n`/predict bet market_123 75 50` (75% probability, $50 stake)\n\n*📊 View Markets:*\n`/predict markets` - List all active markets\n\n*📈 Your Stats:*\n`/predict stats` - View your performance\n\n*🏆 Leaderboards:*\n`/predict leaderboard` - View top performers\n\n*ℹ️ Market Info:*\n`/predict info market_123` - Detailed market view"
       }
     }
   ];
@@ -345,7 +438,7 @@ function getHelpMenu(isAdmin = false) {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "*🎮 Quick Tips:*\n• Everyone starts with $1000\n• Bet range: $1-$100\n• Probability: 0-100 (e.g., 75 = 75%)\n• Bigger bets = more market influence\n• Markets resolve manually by admin"
+        text: "*🎮 Quick Tips:*\n• Everyone starts with $1000\n• Bet range: $1-$100\n• Probability: 0-100 (e.g., 75 = 75%)\n• Bigger bets = more market influence\n• Build streaks for leaderboard glory!"
       }
     },
     {
@@ -366,6 +459,52 @@ function getHelpMenu(isAdmin = false) {
     response_type: 'ephemeral',
     blocks: blocks
   };
+}
+
+// Format leaderboard display
+function formatLeaderboard(users, type, userRank = null) {
+  if (users.length === 0) {
+    return "No data available yet. Start predicting to see leaderboards!";
+  }
+
+  const medals = ['🥇', '🥈', '🥉'];
+  const typeEmojis = {
+    accuracy: '🎯',
+    profit: '💰', 
+    volume: '📊',
+    streak: '🔥'
+  };
+
+  let leaderboardText = `${typeEmojis[type]} *${type.charAt(0).toUpperCase() + type.slice(1)} Leaderboard*\n\n`;
+  
+  users.forEach((user, index) => {
+    const medal = index < 3 ? medals[index] : `${index + 1}.`;
+    const userId = user.id;
+    
+    let stats = '';
+    switch(type) {
+      case 'accuracy':
+        stats = `${(parseFloat(user.accuracy) * 100).toFixed(1)}% (${user.bets_won}/${user.bets_placed})`;
+        break;
+      case 'profit':
+        stats = `$${user.total_profit} profit (Bankroll: $${user.bankroll})`;
+        break;
+      case 'volume':
+        stats = `${user.bets_placed} bets, ${user.markets_created} markets`;
+        break;
+      case 'streak':
+        stats = `${user.best_streak} best streak (Current: ${user.prediction_streak})`;
+        break;
+    }
+    
+    leaderboardText += `${medal} <@${userId}> - ${stats}\n`;
+  });
+
+  if (userRank && userRank > 10) {
+    leaderboardText += `\n📍 Your rank: #${userRank}`;
+  }
+
+  return leaderboardText;
 }
 
 // Parse market creation from natural language
@@ -431,6 +570,62 @@ app.command('/predict', async ({ command, ack, respond }) => {
     return;
   }
   
+  // Leaderboards
+  if (text.startsWith('leaderboard') || text.startsWith('leaderboards')) {
+    const args = text.split(' ');
+    const type = args[1] || 'accuracy'; // Default to accuracy
+    
+    try {
+      let users, leaderboardText;
+      
+      switch(type) {
+        case 'profit':
+        case 'money':
+          users = await getLeaderboardByProfit();
+          leaderboardText = formatLeaderboard(users, 'profit');
+          break;
+        case 'volume':
+        case 'activity':
+          users = await getLeaderboardByVolume();
+          leaderboardText = formatLeaderboard(users, 'volume');
+          break;
+        case 'streak':
+        case 'streaks':
+          users = await getLeaderboardByStreak();
+          leaderboardText = formatLeaderboard(users, 'streak');
+          break;
+        default:
+          users = await getLeaderboardByAccuracy();
+          leaderboardText = formatLeaderboard(users, 'accuracy');
+      }
+      
+      await respond({
+        response_type: 'ephemeral',
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: leaderboardText
+            }
+          },
+          {
+            type: "context",
+            elements: [
+              {
+                type: "mrkdwn",
+                text: "💡 Try: `/predict leaderboard accuracy|profit|volume|streak`"
+              }
+            ]
+          }
+        ]
+      });
+    } catch (error) {
+      await respond(`❌ Error: ${error.message}`);
+    }
+    return;
+  }
+  
   // Resolve market (admin only) - CHECK FIRST!
   if (text.startsWith('resolve ')) {
     if (!isAdmin) {
@@ -473,24 +668,36 @@ app.command('/predict', async ({ command, ack, respond }) => {
         return;
       }
       
-      // Calculate payouts
+      // Calculate payouts and update leaderboard stats
       const payoutPromises = bets.map(async (bet) => {
         const user = await getUser(bet.user_id);
         const accuracy = outcome ? parseFloat(bet.probability) : (1 - parseFloat(bet.probability));
         const payout = Math.floor(bet.stake * (1 + accuracy));
+        const profit = payout - bet.stake;
         
-        // Update user stats
+        // Determine if prediction was correct
         const wasCorrect = (outcome && parseFloat(bet.probability) > 0.5) || (!outcome && parseFloat(bet.probability) < 0.5);
         const newBetsWon = user.bets_won + (wasCorrect ? 1 : 0);
         const newBetsPlaced = user.bets_placed + 1;
-        const newAccuracy = newBetsWon / newBetsPlaced;
+        const newAccuracy = newBetsPlaced > 0 ? newBetsWon / newBetsPlaced : 0.5;
+        
+        // Update streak
+        const newStreak = wasCorrect ? user.prediction_streak + 1 : 0;
+        const newBestStreak = Math.max(user.best_streak || 0, newStreak);
+        
+        // Track biggest win
+        const newBiggestWin = Math.max(user.biggest_win || 0, payout);
         
         await updateUser(bet.user_id, {
           bankroll: user.bankroll + payout,
           total_staked: user.total_staked - bet.stake,
           bets_placed: newBetsPlaced,
           bets_won: newBetsWon,
-          accuracy: newAccuracy
+          accuracy: newAccuracy,
+          total_profit: user.total_profit + profit,
+          biggest_win: newBiggestWin,
+          prediction_streak: newStreak,
+          best_streak: newBestStreak
         });
         
         return `<@${bet.user_id}>: $${payout} (${(accuracy * 100).toFixed(1)}% accuracy)`;
@@ -620,7 +827,7 @@ app.command('/predict', async ({ command, ack, respond }) => {
       
       await respond({
         response_type: 'ephemeral',
-        text: `✅ ${result.message}\n\n📊 Market: *${(result.new_market_probability * 100).toFixed(1)}%*\n💰 Available: $${result.user.bankroll - result.user.total_staked}`
+        text: `✅ ${result.message}\n\n📊 Market: *${(result.new_market_probability * 100).toFixed(1)}%*\n💰 Available: ${result.user.bankroll - result.user.total_staked}`
       });
       
     } catch (error) {
@@ -643,7 +850,7 @@ app.command('/predict', async ({ command, ack, respond }) => {
       }
       
       const marketList = activeMarkets.slice(0, 5).map(market => {
-        return `🎯 *${market.question}*\n📊 ${(parseFloat(market.probability) * 100).toFixed(1)}% | $${market.total_stake} staked\n🆔 \`${market.id}\``;
+        return `🎯 *${market.question}*\n📊 ${(parseFloat(market.probability) * 100).toFixed(1)}% | ${market.total_stake} staked\n🆔 \`${market.id}\``;
       }).join('\n\n');
       
       await respond({
@@ -663,7 +870,7 @@ app.command('/predict', async ({ command, ack, respond }) => {
       
       await respond({
         response_type: 'ephemeral',
-        text: `📊 *Your Stats*\n\n💰 Bankroll: $${user.bankroll}\n📈 Staked: $${user.total_staked}\n💵 Available: $${user.bankroll - user.total_staked}\n\n🏆 Bets: ${user.bets_placed} | ✅ Won: ${user.bets_won}\n📊 Accuracy: ${(parseFloat(user.accuracy) * 100).toFixed(1)}%`
+        text: `📊 *Your Stats*\n\n💰 Bankroll: ${user.bankroll}\n📈 Staked: ${user.total_staked}\n💵 Available: ${user.bankroll - user.total_staked}\n\n🏆 Bets: ${user.bets_placed} | ✅ Won: ${user.bets_won}\n📊 Accuracy: ${(parseFloat(user.accuracy) * 100).toFixed(1)}%\n💰 Total Profit: ${user.total_profit}\n🔥 Current Streak: ${user.prediction_streak}\n⭐ Best Streak: ${user.best_streak}\n🎯 Markets Created: ${user.markets_created}`
       });
     } catch (error) {
       await respond(`❌ Error: ${error.message}`);
@@ -691,12 +898,12 @@ app.command('/predict', async ({ command, ack, respond }) => {
       
       let betDetails = '';
       if (user_bet) {
-        betDetails = `\n🎯 Your bet: $${user_bet.stake} on ${(parseFloat(user_bet.probability) * 100).toFixed(1)}%`;
+        betDetails = `\n🎯 Your bet: ${user_bet.stake} on ${(parseFloat(user_bet.probability) * 100).toFixed(1)}%`;
       }
       
       await respond({
         response_type: 'ephemeral',
-        text: `📊 *Market Details*\n\n*${market.question}*\n\n📈 Probability: *${(parseFloat(market.probability) * 100).toFixed(1)}%*\n💰 Total staked: $${market.total_stake}\n👥 Participants: ${participants}\n⏰ Deadline: ${new Date(market.deadline).toLocaleDateString()}${betDetails}`
+        text: `📊 *Market Details*\n\n*${market.question}*\n\n📈 Probability: *${(parseFloat(market.probability) * 100).toFixed(1)}%*\n💰 Total staked: ${market.total_stake}\n👥 Participants: ${participants}\n⏰ Deadline: ${new Date(market.deadline).toLocaleDateString()}${betDetails}`
       });
     } catch (error) {
       await respond(`❌ Error: ${error.message}`);
@@ -751,7 +958,7 @@ app.action(/^bet_quick_/, async ({ action, ack, respond, body }) => {
     
     await respond({
       response_type: 'ephemeral',
-      text: `✅ Quick bet: $${result.stake_placed} on ${(parseFloat(probability) * 100).toFixed(0)}%\n\n📊 Market: *${(result.new_market_probability * 100).toFixed(1)}%*`
+      text: `✅ Quick bet: ${result.stake_placed} on ${(parseFloat(probability) * 100).toFixed(0)}%\n\n📊 Market: *${(result.new_market_probability * 100).toFixed(1)}%*`
     });
     
   } catch (error) {
@@ -767,7 +974,7 @@ app.action(/^bet_quick_/, async ({ action, ack, respond, body }) => {
   try {
     await initializeDatabase();
     await app.start();
-    console.log('⚡️ Prediction Market Bot with Admin-Only Resolve is running!');
+    console.log('⚡️ Prediction Market Bot with Leaderboards is running!');
     console.log(`🔑 Admin User ID: ${ADMIN_USER_ID}`);
   } catch (error) {
     console.error('Failed to start app:', error);
