@@ -26,6 +26,71 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
+// Enhanced migration function to ensure all columns exist
+async function migrateDatabase() {
+  console.log('🔄 Running database migration...');
+  
+  try {
+    // Add missing columns one by one with error handling
+    const migrations = [
+      {
+        name: 'total_profit',
+        query: 'ALTER TABLE users ADD COLUMN total_profit INTEGER DEFAULT 0'
+      },
+      {
+        name: 'biggest_win', 
+        query: 'ALTER TABLE users ADD COLUMN biggest_win INTEGER DEFAULT 0'
+      },
+      {
+        name: 'prediction_streak',
+        query: 'ALTER TABLE users ADD COLUMN prediction_streak INTEGER DEFAULT 0'
+      },
+      {
+        name: 'best_streak',
+        query: 'ALTER TABLE users ADD COLUMN best_streak INTEGER DEFAULT 0'
+      },
+      {
+        name: 'markets_created',
+        query: 'ALTER TABLE users ADD COLUMN markets_created INTEGER DEFAULT 0'
+      },
+      {
+        name: 'last_active',
+        query: 'ALTER TABLE users ADD COLUMN last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP'
+      }
+    ];
+
+    for (const migration of migrations) {
+      try {
+        await pool.query(migration.query);
+        console.log(`✅ Added column: ${migration.name}`);
+      } catch (error) {
+        if (error.code === '42701') {
+          console.log(`⚠️ Column ${migration.name} already exists`);
+        } else {
+          console.error(`❌ Failed to add ${migration.name}:`, error.message);
+        }
+      }
+    }
+
+    // Initialize existing users with default values
+    await pool.query(`
+      UPDATE users SET 
+        total_profit = COALESCE(total_profit, bankroll - 1000),
+        biggest_win = COALESCE(biggest_win, 0),
+        prediction_streak = COALESCE(prediction_streak, 0),
+        best_streak = COALESCE(best_streak, 0),
+        markets_created = COALESCE(markets_created, 0),
+        last_active = COALESCE(last_active, CURRENT_TIMESTAMP)
+      WHERE total_profit IS NULL OR biggest_win IS NULL
+    `);
+    console.log('✅ Initialized existing user data');
+
+    console.log('🎉 Database migration completed successfully!');
+  } catch (error) {
+    console.error('❌ Migration failed:', error);
+  }
+}
+
 // Initialize database tables
 async function initializeDatabase() {
   try {
@@ -38,35 +103,9 @@ async function initializeDatabase() {
         bets_placed INTEGER DEFAULT 0,
         bets_won INTEGER DEFAULT 0,
         accuracy DECIMAL(5,4) DEFAULT 0.5,
-        total_profit INTEGER DEFAULT 0,
-        biggest_win INTEGER DEFAULT 0,
-        prediction_streak INTEGER DEFAULT 0,
-        best_streak INTEGER DEFAULT 0,
-        markets_created INTEGER DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
-
-    // Add new columns to existing users table if they don't exist
-    const alterQueries = [
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS total_profit INTEGER DEFAULT 0`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS biggest_win INTEGER DEFAULT 0`, 
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS prediction_streak INTEGER DEFAULT 0`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS best_streak INTEGER DEFAULT 0`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS markets_created INTEGER DEFAULT 0`,
-      `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP`,
-      `ALTER TABLE users ALTER COLUMN accuracy TYPE DECIMAL(5,4)`
-    ];
-
-    for (const query of alterQueries) {
-      try {
-        await pool.query(query);
-      } catch (error) {
-        // Ignore errors for columns that already exist
-        console.log('Column may already exist:', error.message);
-      }
-    }
 
     // Create markets table
     await pool.query(`
@@ -100,6 +139,10 @@ async function initializeDatabase() {
     `);
 
     console.log('✅ Database tables initialized successfully');
+    
+    // Run migration to add new columns
+    await migrateDatabase();
+    
   } catch (error) {
     console.error('❌ Database initialization failed:', error);
   }
